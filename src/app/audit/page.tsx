@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { AuditResult } from "@/lib/scanner";
+import { scanCode } from "@/lib/scanner";
 import AttackSimulator, { getAttackSimulation } from "@/components/AttackSimulator";
 import DiffViewer from "@/components/DiffViewer";
 
@@ -95,12 +96,7 @@ export default function AuditPage() {
     setLoading(true);
     setAiResult(null);
     try {
-      const res = await fetch("/api/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, language }),
-      });
-      const data = await res.json();
+      const data = scanCode(code, language);
       setResult(data);
       setActiveTab("results");
     } catch {
@@ -115,24 +111,46 @@ export default function AuditPage() {
     setAiLoading(true);
     setResult(null);
     try {
-      const res = await fetch("/api/ai-scan", {
+      const apiKey = localStorage.getItem("GROQ_API_KEY") || prompt("Enter your Groq API key (free at console.groq.com):\n\nOr click Cancel to use basic scan.");
+      if (!apiKey) {
+        await handleScan();
+        return;
+      }
+      localStorage.setItem("GROQ_API_KEY", apiKey);
+
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, language }),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            { role: "system", content: "You are a Cardano smart contract security auditor. Return valid JSON only." },
+            { role: "user", content: `Analyze this ${language} smart contract for security vulnerabilities. Return JSON:\n{"source":"ai","model":"llama-3.3-70b","riskScore":<0-100>,"summary":"<one paragraph>","vulnerabilities":[{"id":"VULN-001","severity":"critical|high|medium|low|info","title":"<title>","description":"<desc>","line":<number>,"code":"<code line>","recommendation":"<fix>","cwe":"CWE-XXX"}],"gasOptimizations":[{"title":"<title>","description":"<desc>","line":<number>}],"overallAssessment":"<2-3 sentences>"}\n\nCode:\n${code}` },
+          ],
+          temperature: 0.1,
+          max_tokens: 4096,
+        }),
       });
-      const data = await res.json();
-      if (data.fallback) {
-        alert("AI scan requires GROQ_API_KEY (free at console.groq.com). Using basic scan instead.");
+
+      if (!response.ok) {
+        alert("AI scan failed. Using basic scan.");
         await handleScan();
         return;
       }
-      if (data.error) {
-        alert(data.error + ". Using basic scan instead.");
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content || "";
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        setAiResult(result);
+        setActiveTab("results");
+      } else {
         await handleScan();
-        return;
       }
-      setAiResult(data);
-      setActiveTab("results");
     } catch {
       alert("AI scan failed. Using basic scan.");
       await handleScan();
@@ -149,22 +167,56 @@ export default function AuditPage() {
     setShowDiff(false);
     setFixesApplied([]);
     try {
-      const res = await fetch("/api/fix", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, language, vulnerabilities: vulns }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        alert(data.error);
-        return;
+      const apiKey = localStorage.getItem("GROQ_API_KEY");
+      if (apiKey) {
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: "llama-3.3-70b-versatile",
+            messages: [
+              { role: "system", content: "You are a Cardano smart contract security fixer. Return ONLY the fixed code in a code block. No explanation." },
+              { role: "user", content: `Fix this ${language} smart contract:\n\n${code}\n\nVulnerabilities:\n${vulns.map((v: { title: string; description: string; line: number }) => `- Line ${v.line}: ${v.title} — ${v.description}`).join("\n")}` },
+            ],
+            temperature: 0.1,
+            max_tokens: 4096,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const content = data.choices?.[0]?.message?.content || "";
+          const codeMatch = content.match(/```(?:haskell|aiken|marlowe)?\s*\n?([\s\S]*?)```/);
+          const fixed = codeMatch ? codeMatch[1].trim() : content.trim();
+          setFixedCode(fixed);
+          setFixSource("ai");
+          setFixesApplied(["AI-powered fix using Llama 3.3"]);
+          setShowDiff(true);
+          return;
+        }
       }
-      setFixedCode(data.fixedCode);
-      setFixSource(data.source);
-      setFixesApplied(data.fixesApplied || []);
+
+      // Regex fallback
+      let fixed = code;
+      const fixes: string[] = [];
+      for (const vuln of vulns) {
+        const title = vuln.title.toLowerCase();
+        if (title.includes("trace")) { fixed = fixed.replace(/^[ \t]*trace\s+.*\n?/gm, ""); fixes.push("Removed trace() statements"); }
+        if (title.includes("i/o")) { fixed = fixed.replace(/^[ \t]*import\s+System\.IO.*$/gm, "-- import removed"); fixes.push("Removed I/O imports"); }
+        if (title.includes("partial")) { fixes.push("Manual fix needed for partial functions"); }
+        if (title.includes("signature")) { fixes.push("Manual fix needed for signature check"); }
+        if (title.includes("hardcoded")) { fixes.push("Manual fix needed for hardcoded values"); }
+      }
+      fixed = fixed.replace(/\n{3,}/g, "\n\n").trim();
+      setFixedCode(fixed);
+      setFixSource("regex");
+      setFixesApplied(fixes.length > 0 ? fixes : ["No automatic fixes available"]);
       setShowDiff(true);
     } catch {
-      alert("Auto-fix failed. Please try again.");
+      alert("Auto-fix failed.");
     } finally {
       setFixLoading(false);
     }
